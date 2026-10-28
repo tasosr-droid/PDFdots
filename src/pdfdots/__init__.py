@@ -1,0 +1,2 @@
+"""PDF Dots application package."""
+
