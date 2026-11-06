@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,6 +93,143 @@ class PdfGenerationTests(unittest.TestCase):
             )
         self.assertFalse(self.print_path.exists())
         self.assertFalse(self.cut_path.exists())
+
+    def test_true_bleed_expands_print_art_but_preserves_cut_box_and_gap(self) -> None:
+        with pikepdf.Pdf.new() as pdf:
+            page = pdf.add_blank_page(
+                page_size=(214 * 72 / 25.4, 301 * 72 / 25.4)
+            )
+            page.obj["/CropBox"] = pikepdf.Array(
+                [
+                    2 * 72 / 25.4,
+                    2 * 72 / 25.4,
+                    212 * 72 / 25.4,
+                    299 * 72 / 25.4,
+                ]
+            )
+            page.contents_add(
+                pdf.make_stream(b"0 0 1 rg 0 0 214 301 re f\n")
+            )
+            pdf.save(self.source_path)
+
+        generate_pdf_pair(
+            self.source_path,
+            self.print_path,
+            self.cut_path,
+            ["CropBox"],
+            "left_right",
+            1,
+            False,
+            2.5,
+            repeat_columns=2,
+            repeat_gap_mm=5,
+            true_bleed_enabled=True,
+            true_bleed_mm=2,
+        )
+
+        with pikepdf.Pdf.open(self.print_path) as printer, pikepdf.Pdf.open(
+            self.cut_path
+        ) as cutter:
+            print_page = printer.pages[0]
+            cut_page = cutter.pages[0]
+            self.assertAlmostEqual(
+                float(print_page.mediabox[2]) / (72 / 25.4),
+                453,
+                places=3,
+            )
+            self.assertAlmostEqual(
+                float(print_page.mediabox[3]) / (72 / 25.4),
+                303,
+                places=3,
+            )
+            print_content = b"\n".join(
+                bytes(stream.read_bytes())
+                for stream in print_page.obj["/Contents"]
+            )
+            cut_content = b"\n".join(
+                bytes(stream.read_bytes())
+                for stream in cut_page.obj["/Contents"]
+            )
+            cut_rectangles = re.findall(
+                rb"0 0 0 RG 0\.75 w ([\d.-]+) ([\d.-]+) "
+                rb"([\d.-]+) ([\d.-]+) re S",
+                cut_content,
+            )
+
+        self.assertIn(b"606.614174 853.228347 re W n", print_content)
+        self.assertEqual(len(cut_rectangles), 2)
+        cut_xs = [float(rectangle[0]) / (72 / 25.4) for rectangle in cut_rectangles]
+        cut_widths = [
+            float(rectangle[2]) / (72 / 25.4) for rectangle in cut_rectangles
+        ]
+        self.assertAlmostEqual(cut_widths[0], 210, places=3)
+        self.assertAlmostEqual(cut_widths[1], 210, places=3)
+        self.assertAlmostEqual(cut_xs[1] - cut_xs[0] - cut_widths[0], 5, places=3)
+
+    def test_true_bleed_works_for_single_layout_page_copies(self) -> None:
+        with pikepdf.Pdf.new() as pdf:
+            page = pdf.add_blank_page(
+                page_size=(214 * 72 / 25.4, 301 * 72 / 25.4)
+            )
+            page.obj["/CropBox"] = pikepdf.Array(
+                [
+                    2 * 72 / 25.4,
+                    2 * 72 / 25.4,
+                    212 * 72 / 25.4,
+                    299 * 72 / 25.4,
+                ]
+            )
+            page.contents_add(
+                pdf.make_stream(b"0 0 1 rg 0 0 214 301 re f\n")
+            )
+            pdf.save(self.source_path)
+
+        generate_pdf_pair(
+            self.source_path,
+            self.print_path,
+            self.cut_path,
+            ["CropBox"],
+            "left_right",
+            1,
+            False,
+            2.5,
+            repeat_columns=2,
+            repeat_gap_mm=5,
+            page_copy_counts=[2],
+            true_bleed_enabled=True,
+            true_bleed_mm=2,
+        )
+
+        with pikepdf.Pdf.open(self.print_path) as printer, pikepdf.Pdf.open(
+            self.cut_path
+        ) as cutter:
+            form = printer.pages[0].obj["/Resources"]["/XObject"]["/Page1"]
+            form_box = form["/BBox"]
+            self.assertAlmostEqual(
+                float(printer.pages[0].mediabox[2]) / (72 / 25.4),
+                453,
+                places=3,
+            )
+            self.assertAlmostEqual(
+                (float(form_box[2]) - float(form_box[0])) / (72 / 25.4),
+                214,
+                places=3,
+            )
+            cut_content = b"\n".join(
+                bytes(stream.read_bytes())
+                for stream in cutter.pages[0].obj["/Contents"]
+            )
+            cut_rectangles = re.findall(
+                rb"0 0 0 RG 0\.75 w ([\d.-]+) ([\d.-]+) "
+                rb"([\d.-]+) ([\d.-]+) re S",
+                cut_content,
+            )
+        self.assertEqual(len(cut_rectangles), 2)
+        cut_xs = [float(rectangle[0]) / (72 / 25.4) for rectangle in cut_rectangles]
+        cut_widths = [
+            float(rectangle[2]) / (72 / 25.4) for rectangle in cut_rectangles
+        ]
+        self.assertAlmostEqual(cut_xs[1] - cut_xs[0] - cut_widths[0], 5, places=3)
 
     def test_generates_variable_size_pages_from_per_page_box_choices(self) -> None:
         with pikepdf.Pdf.new() as pdf:
@@ -314,6 +452,81 @@ class PdfGenerationTests(unittest.TestCase):
             )
             self.assertEqual(final_cutter_content.count(b" re S"), 1)
             self.assertEqual(final_cutter_content.count(b" h f"), 4)
+
+    def test_places_individual_document_page_copies_in_fixed_grid(self) -> None:
+        with pikepdf.Pdf.new() as pdf:
+            for page_number in range(2):
+                page = pdf.add_blank_page(
+                    page_size=(215 * 72 / 25.4, 302 * 72 / 25.4)
+                )
+                page.contents_add(
+                    pdf.make_stream(
+                        f"0 0 1 rg {page_number + 1} 10 20 20 re f\n".encode()
+                    )
+                )
+            pdf.save(self.source_path)
+
+        generate_pdf_pair(
+            self.source_path,
+            self.print_path,
+            self.cut_path,
+            ["MediaBox", "MediaBox"],
+            "left_right",
+            1,
+            True,
+            2.5,
+            repeat_columns=2,
+            repeat_rows=2,
+            repeat_gap_mm=5,
+            page_copy_counts=[2, 2],
+        )
+
+        with pikepdf.Pdf.open(self.print_path) as printer, pikepdf.Pdf.open(
+            self.cut_path
+        ) as cutter:
+            self.assertEqual(len(printer.pages), 1)
+            self.assertEqual(len(cutter.pages), 1)
+            self.assertAlmostEqual(
+                float(printer.pages[0].mediabox[2]), 459 * 72 / 25.4, places=4
+            )
+            self.assertAlmostEqual(
+                float(printer.pages[0].mediabox[3]), 611 * 72 / 25.4, places=4
+            )
+            print_content = b"\n".join(
+                bytes(stream.read_bytes())
+                for stream in printer.pages[0].obj["/Contents"]
+            )
+            cut_content = b"\n".join(
+                bytes(stream.read_bytes())
+                for stream in cutter.pages[0].obj["/Contents"]
+            )
+            cut_rectangles = [
+                [float(value) for value in line.split()[-6:-2]]
+                for line in cut_content.splitlines()
+                if line.endswith(b" re S")
+            ]
+
+        self.assertEqual(print_content.count(b" Do Q"), 4)
+        self.assertEqual(print_content.count(b" h f"), 4)
+        self.assertEqual(cut_content.count(b" re S"), 4)
+        for rectangle in cut_rectangles:
+            self.assertAlmostEqual(rectangle[2], 210 * 72 / 25.4, places=5)
+            self.assertAlmostEqual(rectangle[3], 297 * 72 / 25.4, places=5)
+        self.assertAlmostEqual(
+            cut_rectangles[0][0],
+            14.5 * 72 / 25.4,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            cut_rectangles[1][0] - cut_rectangles[0][0],
+            220 * 72 / 25.4,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            abs(cut_rectangles[0][1] - cut_rectangles[2][1]),
+            307 * 72 / 25.4,
+            places=5,
+        )
 
     def test_selected_crop_box_clips_source_content_to_that_box(self) -> None:
         with pikepdf.Pdf.new() as pdf:

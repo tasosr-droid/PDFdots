@@ -15,7 +15,10 @@ from pdfdots.pdf_inspection import (
     POINTS_PER_MM,
     cutter_rectangle_size,
     document_layout_geometries,
+    expanded_bleed_box,
     repeated_output_geometry,
+    repeated_document_layout_geometry,
+    true_bleed_gap_mm,
 )
 
 DotLayout = Literal["left_right", "top_bottom"]
@@ -63,6 +66,9 @@ def generate_pdf_pair(
     repeat_rows: int = 1,
     repeat_gap_mm: float = DEFAULT_REPEAT_GAP_MM,
     arrange_document_pages: bool = False,
+    page_copy_counts: list[int] | None = None,
+    true_bleed_enabled: bool = False,
+    true_bleed_mm: float = 2.0,
 ) -> None:
     if len(box_names) == 0:
         raise ValueError("The source PDF contains no pages.")
@@ -91,6 +97,9 @@ def generate_pdf_pair(
             repeat_rows,
             repeat_gap_mm,
             arrange_document_pages,
+            page_copy_counts,
+            true_bleed_enabled,
+            true_bleed_mm,
         )
         os.replace(print_temp, print_path)
         os.replace(cut_temp, cut_path)
@@ -112,13 +121,40 @@ def _build_pdf_pair(
     repeat_rows: int,
     repeat_gap_mm: float,
     arrange_document_pages: bool,
+    page_copy_counts: list[int] | None,
+    true_bleed_enabled: bool,
+    true_bleed_mm: float,
 ) -> None:
+    has_adjacent_pages = (
+        sum(page_copy_counts) > 1
+        if page_copy_counts is not None
+        else (
+            arrange_document_pages
+            and len(box_names) > 1
+            and repeat_columns * repeat_rows > 1
+        )
+        or (
+            not arrange_document_pages
+            and (repeat_columns > 1 or repeat_rows > 1)
+        )
+    )
+    layout_gap_mm = (
+        true_bleed_gap_mm(repeat_gap_mm, true_bleed_mm)
+        if true_bleed_enabled and has_adjacent_pages
+        else repeat_gap_mm
+    )
     with pikepdf.Pdf.open(source_path) as source_pdf, pikepdf.Pdf.new() as cut_pdf:
         if len(source_pdf.pages) != len(box_names):
             raise ValueError("Source page count changed; reload the PDF and try again.")
 
-        if arrange_document_pages:
+        if arrange_document_pages or page_copy_counts is not None:
+            if arrange_document_pages and page_copy_counts is not None:
+                raise ValueError(
+                    "Document arrangement and individual page copies cannot "
+                    "be enabled together."
+                )
             boxes = []
+            layout_boxes = []
             for index, (source_page, box_name) in enumerate(
                 zip(source_pdf.pages, box_names), start=1
             ):
@@ -135,14 +171,38 @@ def _build_pdf_pair(
                         f"Page {index} is rotated. Rotated pages are not supported yet; "
                         "save an upright copy of the PDF and reload it."
                     )
-                boxes.append(_box_dimensions(source_page, box_name))
-            layouts = document_layout_geometries(
-                boxes,
-                layout,
-                safety_distance_mm,
-                repeat_columns,
-                repeat_rows,
-                repeat_gap_mm,
+                box = _box_dimensions(source_page, box_name)
+                boxes.append(box)
+                layout_boxes.append(
+                    expanded_bleed_box(
+                        box,
+                        _box_dimensions(source_page, "MediaBox"),
+                        true_bleed_mm,
+                    )
+                    if true_bleed_enabled
+                    else box
+                )
+            layouts = (
+                [
+                    repeated_document_layout_geometry(
+                        layout_boxes,
+                        page_copy_counts,
+                        layout,
+                        safety_distance_mm,
+                        repeat_columns,
+                        repeat_rows,
+                        layout_gap_mm,
+                    )
+                ]
+                if page_copy_counts is not None
+                else document_layout_geometries(
+                    layout_boxes,
+                    layout,
+                    safety_distance_mm,
+                    repeat_columns,
+                    repeat_rows,
+                    layout_gap_mm,
+                )
             )
             with pikepdf.Pdf.new() as print_pdf:
                 _build_document_layout_pair(
@@ -150,6 +210,7 @@ def _build_pdf_pair(
                     print_pdf,
                     cut_pdf,
                     boxes,
+                    layout_boxes,
                     layouts,
                     layout,
                     fake_bleed_enabled,
@@ -171,13 +232,22 @@ def _build_pdf_pair(
                 )
 
             box = _box_dimensions(source_page, box_name)
+            layout_box = (
+                expanded_bleed_box(
+                    box,
+                    _box_dimensions(source_page, "MediaBox"),
+                    true_bleed_mm,
+                )
+                if true_bleed_enabled
+                else box
+            )
             geometry = repeated_output_geometry(
-                box,
+                layout_box,
                 layout,
                 safety_distance_mm,
                 repeat_columns,
                 repeat_rows,
-                repeat_gap_mm,
+                layout_gap_mm,
             )
             cut_width_mm, cut_height_mm = (
                 cutter_rectangle_size(box, fake_bleed_inset_mm)
@@ -187,23 +257,23 @@ def _build_pdf_pair(
             _prepare_printer_page(
                 source_pdf,
                 source_page,
-                box,
+                layout_box,
                 geometry,
                 layout,
                 repeat_columns,
                 repeat_rows,
-                repeat_gap_mm,
+                layout_gap_mm,
             )
             _create_cutter_page(
                 cut_pdf,
                 geometry,
-                box,
+                layout_box,
                 layout,
                 cut_width_mm,
                 cut_height_mm,
                 repeat_columns,
                 repeat_rows,
-                repeat_gap_mm,
+                layout_gap_mm,
             )
 
         source_pdf.save(print_temp)
@@ -215,6 +285,7 @@ def _build_document_layout_pair(
     print_pdf: pikepdf.Pdf,
     cut_pdf: pikepdf.Pdf,
     boxes: list[BoxDimensions],
+    layout_boxes: list[BoxDimensions],
     layouts: list[DocumentLayoutGeometry],
     layout: DotLayout,
     fake_bleed_enabled: bool,
@@ -232,15 +303,31 @@ def _build_document_layout_pair(
         commands = bytearray()
         for placement in layout_geometry.placements:
             source_page = source_pdf.pages[placement.page_index]
-            box = boxes[placement.page_index]
-            source_media_box = pikepdf.Array(source_page.mediabox)
-            source_page.obj["/MediaBox"] = pikepdf.Array(
+            box = layout_boxes[placement.page_index]
+            box_array = pikepdf.Array(
                 [box.left, box.bottom, box.right, box.top]
             )
+            page_box_keys = (
+                "/MediaBox",
+                "/CropBox",
+                "/BleedBox",
+                "/TrimBox",
+                "/ArtBox",
+            )
+            original_boxes = {
+                key: source_page.obj.get(key)
+                for key in page_box_keys
+            }
+            for key in page_box_keys:
+                source_page.obj[key] = box_array
             try:
                 source_form = source_page.as_form_xobject()
             finally:
-                source_page.obj["/MediaBox"] = source_media_box
+                for key, original_box in original_boxes.items():
+                    if original_box is None:
+                        del source_page.obj[key]
+                    else:
+                        source_page.obj[key] = original_box
             form = print_pdf.copy_foreign(source_form)
             resource_name = f"/Page{placement.page_index + 1}"
             xobjects[resource_name] = form
@@ -290,6 +377,7 @@ def _build_document_layout_pair(
             cut_pdf,
             layout_geometry,
             boxes,
+            layout_boxes,
             layout,
             fake_bleed_enabled,
             fake_bleed_inset_mm,
@@ -300,6 +388,7 @@ def _create_document_cutter_page(
     pdf: pikepdf.Pdf,
     geometry: DocumentLayoutGeometry,
     boxes: list[BoxDimensions],
+    layout_boxes: list[BoxDimensions],
     layout: DotLayout,
     fake_bleed_enabled: bool,
     fake_bleed_inset_mm: float,
@@ -327,6 +416,7 @@ def _create_document_cutter_page(
     )
     for placement in geometry.placements:
         box = boxes[placement.page_index]
+        layout_box = layout_boxes[placement.page_index]
         cut_width_mm, cut_height_mm = (
             cutter_rectangle_size(box, fake_bleed_inset_mm)
             if fake_bleed_enabled
@@ -335,12 +425,14 @@ def _create_document_cutter_page(
         cut_width = cut_width_mm * POINTS_PER_MM
         cut_height = cut_height_mm * POINTS_PER_MM
         cut_x = (
-            geometry.source_offset_x_mm + placement.offset_x_mm
-            + (box.width_mm - cut_width_mm) / 2
+            geometry.source_offset_x_mm
+            + placement.offset_x_mm
+            + (layout_box.width_mm - cut_width_mm) / 2
         ) * POINTS_PER_MM
         cut_y = (
-            geometry.source_offset_y_mm + placement.offset_y_mm
-            + (box.height_mm - cut_height_mm) / 2
+            geometry.source_offset_y_mm
+            + placement.offset_y_mm
+            + (layout_box.height_mm - cut_height_mm) / 2
         ) * POINTS_PER_MM
         commands.extend(
             (

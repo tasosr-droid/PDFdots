@@ -83,6 +83,46 @@ def cutter_rectangle_size(
     return width, height
 
 
+def expanded_bleed_box(
+    box: BoxDimensions,
+    media_box: BoxDimensions,
+    bleed_mm: float,
+) -> BoxDimensions:
+    """Return the source clip box extended into existing artwork on each side."""
+    if bleed_mm < 0:
+        raise ValueError("True bleed cannot be negative.")
+    bleed_points = bleed_mm * POINTS_PER_MM
+    expanded = BoxDimensions(
+        name=box.name,
+        left=box.left - bleed_points,
+        bottom=box.bottom - bleed_points,
+        right=box.right + bleed_points,
+        top=box.top + bleed_points,
+    )
+    if (
+        expanded.left < media_box.left - 1e-6
+        or expanded.bottom < media_box.bottom - 1e-6
+        or expanded.right > media_box.right + 1e-6
+        or expanded.top > media_box.top + 1e-6
+    ):
+        raise ValueError(
+            f"{bleed_mm:.2f} mm true bleed extends beyond the page's MediaBox "
+            f"outside the selected {box.name}."
+        )
+    return expanded
+
+
+def true_bleed_gap_mm(repeat_gap_mm: float, bleed_mm: float) -> float:
+    """Keep the configured gap between cut boxes after artwork is expanded."""
+    image_gap_mm = repeat_gap_mm - 2 * bleed_mm
+    if image_gap_mm < 0:
+        raise ValueError(
+            "True bleed would make neighboring printed pages overlap. "
+            "Increase the page gap or reduce the bleed amount."
+        )
+    return image_gap_mm
+
+
 def expanded_output_geometry(
     box: BoxDimensions,
     layout: str,
@@ -255,6 +295,110 @@ def document_layout_geometries(
             )
         )
     return layouts
+
+
+def repeated_document_layout_geometry(
+    boxes: list[BoxDimensions],
+    page_copy_counts: list[int],
+    layout: str,
+    safety_distance_mm: float,
+    repeat_columns: int,
+    repeat_rows: int,
+    repeat_gap_mm: float,
+) -> DocumentLayoutGeometry:
+    """Place each requested page copy in a fixed row-major grid."""
+    if not boxes:
+        raise ValueError("No pages were selected for output.")
+    if len(boxes) != len(page_copy_counts):
+        raise ValueError("Copy counts must match the selected source pages.")
+    if repeat_columns < 1 or repeat_rows < 1:
+        raise ValueError("Repeat rows and columns must be at least one.")
+    if repeat_gap_mm < 0:
+        raise ValueError("Repeat gap cannot be negative.")
+    if any(count < 0 for count in page_copy_counts):
+        raise ValueError("Page copy counts cannot be negative.")
+
+    capacity = repeat_columns * repeat_rows
+    copy_total = sum(page_copy_counts)
+    if copy_total == 0:
+        raise ValueError("At least one page copy is required.")
+    if copy_total > capacity:
+        raise ValueError(
+            f"The selected pages require {copy_total} grid slots, but the "
+            f"layout has only {capacity}."
+        )
+
+    column_widths = [0.0] * repeat_columns
+    row_heights = [0.0] * repeat_rows
+    slot_pages: list[int] = []
+    for page_index, copy_count in enumerate(page_copy_counts):
+        slot_pages.extend([page_index] * copy_count)
+    for slot, page_index in enumerate(slot_pages):
+        column = slot % repeat_columns
+        row = slot // repeat_columns
+        column_widths[column] = max(column_widths[column], boxes[page_index].width_mm)
+        row_heights[row] = max(row_heights[row], boxes[page_index].height_mm)
+    fallback_width = max(box.width_mm for box in boxes)
+    fallback_height = max(box.height_mm for box in boxes)
+    column_widths = [width or fallback_width for width in column_widths]
+    row_heights = [height or fallback_height for height in row_heights]
+
+    grid_width = sum(column_widths) + (repeat_columns - 1) * repeat_gap_mm
+    grid_height = sum(row_heights) + (repeat_rows - 1) * repeat_gap_mm
+    grid_box = BoxDimensions(
+        "Repeated document layout",
+        0,
+        0,
+        grid_width * POINTS_PER_MM,
+        grid_height * POINTS_PER_MM,
+    )
+    output = expanded_output_geometry(
+        grid_box,
+        layout,
+        safety_distance_mm,
+    )
+
+    column_offsets: list[float] = []
+    offset = 0.0
+    for width in column_widths:
+        column_offsets.append(offset)
+        offset += width + repeat_gap_mm
+
+    row_offsets: list[float] = []
+    offset = grid_height
+    for height in row_heights:
+        offset -= height
+        row_offsets.append(offset)
+        offset -= repeat_gap_mm
+
+    placements: list[DocumentPagePlacement] = []
+    for slot, page_index in enumerate(slot_pages):
+        box = boxes[page_index]
+        column = slot % repeat_columns
+        row = slot // repeat_columns
+        placements.append(
+            DocumentPagePlacement(
+                page_index=page_index,
+                offset_x_mm=(
+                    column_offsets[column]
+                    + (column_widths[column] - box.width_mm) / 2
+                ),
+                offset_y_mm=(
+                    row_offsets[row]
+                    + (row_heights[row] - box.height_mm) / 2
+                ),
+            )
+        )
+
+    return DocumentLayoutGeometry(
+        width_mm=output.width_mm,
+        height_mm=output.height_mm,
+        source_offset_x_mm=output.source_offset_x_mm,
+        source_offset_y_mm=output.source_offset_y_mm,
+        grid_width_mm=grid_width,
+        grid_height_mm=grid_height,
+        placements=tuple(placements),
+    )
 
 
 def inspect_pdf(path: Path) -> list[PageDimensions]:

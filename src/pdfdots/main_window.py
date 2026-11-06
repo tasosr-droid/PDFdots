@@ -1,9 +1,20 @@
 from collections.abc import Callable
+from io import BytesIO
 from pathlib import Path
 
 import pikepdf
-from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen
+from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPen,
+)
+from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -37,8 +48,11 @@ from pdfdots.pdf_inspection import (
     PageDimensions,
     cutter_rectangle_size,
     document_layout_geometries,
+    expanded_bleed_box,
     inspect_pdf,
+    repeated_document_layout_geometry,
     repeated_output_geometry,
+    true_bleed_gap_mm,
 )
 from pdfdots.pdf_generation import generate_pdf_pair, output_file_paths
 from pdfdots.resources import resource_path
@@ -82,9 +96,10 @@ class OutputPreviewWidget(QWidget):
             tuple[
                 OutputPageGeometry,
                 str,
-                list[tuple[BoxDimensions, float, float, float, float]],
+                list[tuple[object, ...]],
                 float,
                 float,
+                bool,
             ]
             | None
         ) = None
@@ -99,8 +114,9 @@ class OutputPreviewWidget(QWidget):
         repeat_columns: int = 1,
         repeat_rows: int = 1,
         repeat_gap_mm: float = DEFAULT_REPEAT_GAP_MM,
-        tiles: list[tuple[BoxDimensions, float, float, float, float]] | None = None,
+        tiles: list[tuple[object, ...]] | None = None,
         layout_extent_mm: tuple[float, float] | None = None,
+        show_page_numbers: bool = False,
     ) -> None:
         if tiles is None:
             tiles = []
@@ -115,6 +131,8 @@ class OutputPreviewWidget(QWidget):
                             tile_y,
                             cut_width_mm,
                             cut_height_mm,
+                            None,
+                            None,
                         )
                     )
         if layout_extent_mm is None:
@@ -130,6 +148,7 @@ class OutputPreviewWidget(QWidget):
             tiles,
             layout_extent_mm[0],
             layout_extent_mm[1],
+            show_page_numbers,
         )
         self.update()
 
@@ -146,6 +165,7 @@ class OutputPreviewWidget(QWidget):
             tiles,
             layout_width,
             layout_height,
+            show_page_numbers,
         ) = self._preview
         output_width = geometry.width_mm
         output_height = geometry.height_mm
@@ -176,16 +196,64 @@ class OutputPreviewWidget(QWidget):
         source_y = geometry.source_offset_y_mm
         painter.setPen(QPen(QColor("#526174"), 1.0))
         painter.setBrush(QColor("#dce6f1"))
-        for tile_box, tile_x, tile_y, cut_width_mm, cut_height_mm in tiles:
+        for tile in tiles:
+            tile_box = tile[0]
+            tile_x, tile_y, cut_width_mm, cut_height_mm = tile[1:5]
+            page_number = tile[5] if len(tile) > 5 else None
+            page_image = tile[6] if len(tile) > 6 else None
+            if not isinstance(tile_box, BoxDimensions):
+                continue
             tile_x += source_x
             tile_y += source_y
             source_top_left = point(tile_x, tile_y + tile_box.height_mm)
+            source_rect = QRectF(
+                source_top_left.x(),
+                source_top_left.y(),
+                tile_box.width_mm * scale,
+                tile_box.height_mm * scale,
+            )
+            if isinstance(page_image, QImage) and not page_image.isNull():
+                image = page_image.scaled(
+                    source_rect.size().toSize(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                image_x = source_rect.center().x() - image.width() / 2
+                image_y = source_rect.center().y() - image.height() / 2
+                painter.drawImage(QPointF(image_x, image_y), image)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            else:
+                painter.setBrush(QColor("#dce6f1"))
+            painter.setPen(QPen(QColor("#526174"), 1.0))
             painter.drawRect(
                 source_top_left.x(),
                 source_top_left.y(),
                 tile_box.width_mm * scale,
                 tile_box.height_mm * scale,
             )
+            if show_page_numbers and page_number is not None:
+                page_number = int(page_number)
+                label_width = min(source_rect.width() * 0.7, 100.0)
+                label_height = min(source_rect.height() * 0.55, 76.0)
+                number_rect = QRectF(
+                    source_rect.center().x() - label_width / 2,
+                    source_rect.center().y() - label_height / 2,
+                    label_width,
+                    label_height,
+                )
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(20, 25, 32, 190))
+                painter.drawRoundedRect(number_rect, 8, 8)
+                font = QFont()
+                font.setBold(True)
+                font.setPixelSize(max(14, min(60, int(label_height * 0.72))))
+                painter.setFont(font)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(
+                    number_rect,
+                    Qt.AlignmentFlag.AlignCenter,
+                    str(page_number),
+                )
 
             cut_x = tile_x + (tile_box.width_mm - cut_width_mm) / 2
             cut_y = tile_y + (tile_box.height_mm - cut_height_mm) / 2
@@ -199,7 +267,7 @@ class OutputPreviewWidget(QWidget):
                 cut_height_mm * scale,
             )
             painter.setPen(QPen(QColor("#526174"), 1.0))
-            painter.setBrush(QColor("#dce6f1"))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
 
         if layout == "left_right":
             centers = (
@@ -230,6 +298,57 @@ class OutputPreviewWidget(QWidget):
         painter.end()
 
 
+    def clear_preview(self) -> None:
+        self._preview = None
+        self.update()
+
+    def copy_preview_to(self, other: "OutputPreviewWidget") -> None:
+        other._preview = self._preview
+        other.update()
+
+
+class ExpandedPreviewWindow(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("PDF Dots — output preview")
+        self.resize(1200, 850)
+        self._windowed_geometry = self.geometry()
+        self._preview_widget = OutputPreviewWidget()
+        self._preview_widget.setMinimumSize(640, 480)
+        self._details_label = QLabel()
+        self._details_label.setWordWrap(True)
+        self._fullscreen_button = QPushButton("Full screen")
+        self._fullscreen_button.clicked.connect(self._toggle_fullscreen)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        controls.addWidget(self._fullscreen_button)
+        controls.addWidget(close_button)
+        layout = QVBoxLayout(self)
+        layout.addLayout(controls)
+        layout.addWidget(self._preview_widget, stretch=1)
+        layout.addWidget(self._details_label)
+
+    def update_preview(
+        self,
+        preview_widget: OutputPreviewWidget,
+        details: str,
+    ) -> None:
+        preview_widget.copy_preview_to(self._preview_widget)
+        self._details_label.setText(details)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+            self.setGeometry(self._windowed_geometry)
+            self._fullscreen_button.setText("Full screen")
+        else:
+            self._windowed_geometry = self.geometry()
+            self.showFullScreen()
+            self._fullscreen_button.setText("Exit full screen")
+
+
 class OutputPreviewDialog(QDialog):
     def __init__(
         self,
@@ -243,6 +362,7 @@ class OutputPreviewDialog(QDialog):
         repeat_rows: int = 1,
         repeat_gap_mm: float = DEFAULT_REPEAT_GAP_MM,
         arrange_document_pages: bool = False,
+        combine_document_pages: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Output layout preview")
@@ -256,9 +376,25 @@ class OutputPreviewDialog(QDialog):
         self._repeat_rows = repeat_rows
         self._repeat_gap_mm = repeat_gap_mm
         self._arrange_document_pages = arrange_document_pages
+        self._combine_document_pages = combine_document_pages
+        selected_boxes = [
+            page.boxes[box_name] for page, box_name in selected_pages
+        ]
         self._document_layouts: list[DocumentLayoutGeometry] = (
-            document_layout_geometries(
-                [page.boxes[box_name] for page, box_name in selected_pages],
+            [
+                repeated_document_layout_geometry(
+                    selected_boxes,
+                    [1] * len(selected_boxes),
+                    layout,
+                    safety_distance_mm,
+                    repeat_columns,
+                    repeat_rows,
+                    repeat_gap_mm,
+                )
+            ]
+            if combine_document_pages
+            else document_layout_geometries(
+                selected_boxes,
                 layout,
                 safety_distance_mm,
                 repeat_columns,
@@ -274,7 +410,7 @@ class OutputPreviewDialog(QDialog):
         page_label = QLabel("Preview page:")
         page_row.addWidget(page_label)
         self._page_selector = QComboBox()
-        if arrange_document_pages:
+        if arrange_document_pages or combine_document_pages:
             capacity = repeat_columns * repeat_rows
             for layout_index, document_layout in enumerate(
                 self._document_layouts,
@@ -284,9 +420,15 @@ class OutputPreviewDialog(QDialog):
                     selected_pages[placement.page_index][0].page_number
                     for placement in document_layout.placements
                 ]
+                page_description = (
+                    f"{capacity} copies per page"
+                    if combine_document_pages
+                    else f"{capacity} slots"
+                )
                 self._page_selector.addItem(
                     f"Layout {layout_index} — pages "
-                    f"{page_numbers[0]}–{page_numbers[-1]} ({capacity} slots)",
+                    f"{page_numbers[0]}–{page_numbers[-1]} "
+                    f"({page_description})",
                     layout_index - 1,
                 )
         else:
@@ -299,7 +441,7 @@ class OutputPreviewDialog(QDialog):
         page_row.addStretch()
         selector_visible = (
             len(self._document_layouts) > 1
-            if arrange_document_pages
+            if arrange_document_pages or combine_document_pages
             else len(selected_pages) > 1
         )
         self._page_selector.setVisible(selector_visible)
@@ -331,7 +473,7 @@ class OutputPreviewDialog(QDialog):
         if not self._selected_pages:
             return
         index = self._page_selector.currentIndex()
-        if self._arrange_document_pages:
+        if self._arrange_document_pages or self._combine_document_pages:
             document_layout = self._document_layouts[index]
             tiles = []
             for placement in document_layout.placements:
@@ -376,11 +518,16 @@ class OutputPreviewDialog(QDialog):
                     document_layout.grid_height_mm,
                 ),
             )
+            layout_note = (
+                "each page repeated; page grids stacked"
+                if self._combine_document_pages
+                else "unused slots blank"
+            )
             self._details_label.setText(
                 f"Output: {geometry.width_mm:.2f} x {geometry.height_mm:.2f} mm  |  "
                 f"Layout {index + 1}: source pages {first_page}–{last_page}  |  "
                 f"{self._repeat_columns} x {self._repeat_rows}, "
-                f"{self._repeat_gap_mm:.2f} mm gap; unused slots blank; "
+                f"{self._repeat_gap_mm:.2f} mm gap; {layout_note}; "
                 "dots only outside"
             )
             return
@@ -427,6 +574,7 @@ class RepeatLayoutDialog(QDialog):
         repeat_gap_mm: float = DEFAULT_REPEAT_GAP_MM,
         parent: QWidget | None = None,
         arrange_document_pages: bool = False,
+        combine_document_pages: bool = False,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Page layout settings")
@@ -450,10 +598,24 @@ class RepeatLayoutDialog(QDialog):
             "Arrange consecutive document pages in the grid"
         )
         self._arrange_pages.setChecked(arrange_document_pages)
+        self._combine_pages = QCheckBox(
+            "Put all document pages on one layout and repeat each page"
+        )
+        self._combine_pages.setChecked(combine_document_pages)
+        self._arrange_pages.toggled.connect(
+            lambda checked: self._combine_pages.setChecked(False)
+            if checked
+            else None
+        )
+        self._combine_pages.toggled.connect(
+            lambda checked: self._arrange_pages.setChecked(False)
+            if checked
+            else None
+        )
 
-        controls.addWidget(QLabel("Pages horizontally:"))
+        controls.addWidget(QLabel("Columns:"))
         controls.addWidget(self._columns)
-        controls.addWidget(QLabel("Pages vertically:"))
+        controls.addWidget(QLabel("Rows:"))
         controls.addWidget(self._rows)
         controls.addWidget(QLabel("Gap:"))
         controls.addWidget(self._gap)
@@ -461,11 +623,13 @@ class RepeatLayoutDialog(QDialog):
         dialog_layout.addWidget(
             QLabel(
                 "When off, each source page repeats across its own layout. "
-                "When on, consecutive document pages fill the grid row by row. "
-                "Unused slots on the final layout stay blank."
+                "Arrange mode places consecutive pages once per grid slot. "
+                "Single-layout mode stacks a repeat grid for every page "
+                "vertically on one sheet."
             )
         )
         dialog_layout.addWidget(self._arrange_pages)
+        dialog_layout.addWidget(self._combine_pages)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
@@ -475,12 +639,13 @@ class RepeatLayoutDialog(QDialog):
         dialog_layout.addWidget(buttons)
 
     @property
-    def settings(self) -> tuple[int, int, float, bool]:
+    def settings(self) -> tuple[int, int, float, bool, bool]:
         return (
             self._columns.value(),
             self._rows.value(),
             self._gap.value(),
             self._arrange_pages.isChecked(),
+            self._combine_pages.isChecked(),
         )
 
 
@@ -488,17 +653,22 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setAcceptDrops(True)
-        self.setWindowTitle("PDF Dots v0.4 by Tasos Rizopoulos 2026")
+        self.setWindowTitle("PDF Dots v0.5 by Tasos Rizopoulos 2026")
         self.setWindowIcon(QIcon(str(resource_path("dots.png"))))
         self.setMinimumSize(1060, 680)
 
         self._source_path: Path | None = None
         self._output_directory: Path | None = None
         self._pages: list[PageDimensions] = []
+        self._pdf_preview_document: QPdfDocument | None = None
+        self._preview_pdf_buffer: QBuffer | None = None
+        self._preview_image_cache: dict[int, QImage] = {}
+        self._preview_error: str | None = None
         self._repeat_columns = 1
         self._repeat_rows = 1
         self._repeat_gap_mm = DEFAULT_REPEAT_GAP_MM
         self._arrange_document_pages = False
+        self._repeat_pages_individually = False
 
         self._source_field = PdfDropLineEdit()
         self._source_field.setReadOnly(True)
@@ -541,9 +711,9 @@ class MainWindow(QMainWindow):
             source_size_layout.addWidget(radio)
             radio.toggled.connect(self._refresh_summary)
 
-        self._dimensions_table = QTableWidget(0, len(BOX_NAMES) + 2)
+        self._dimensions_table = QTableWidget(0, len(BOX_NAMES) + 3)
         self._dimensions_table.setHorizontalHeaderLabels(
-            ["Page", *BOX_NAMES, "Selected source box"]
+            ["Page", *BOX_NAMES, "Selected source box", "Copies"]
         )
         self._dimensions_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers
@@ -588,13 +758,79 @@ class MainWindow(QMainWindow):
         self._fake_bleed_checkbox.toggled.connect(self._fake_bleed_inset.setEnabled)
         self._fake_bleed_checkbox.toggled.connect(self._refresh_summary)
         self._fake_bleed_inset.valueChanged.connect(self._refresh_summary)
-        bleed_group = QGroupBox("Cutter rectangle")
-        bleed_layout = QHBoxLayout(bleed_group)
-        bleed_layout.addWidget(self._fake_bleed_checkbox)
-        bleed_layout.addWidget(QLabel("Inset on each side:"))
-        bleed_layout.addWidget(self._fake_bleed_inset)
-        bleed_layout.addWidget(QLabel("mm"))
-        bleed_layout.addStretch()
+        fake_bleed_layout = QHBoxLayout()
+        fake_bleed_layout.addWidget(self._fake_bleed_checkbox)
+        fake_bleed_layout.addWidget(QLabel("Inset on each side:"))
+        fake_bleed_layout.addWidget(self._fake_bleed_inset)
+        fake_bleed_layout.addWidget(QLabel("mm"))
+        fake_bleed_layout.addStretch()
+
+        self._true_bleed_checkbox = QCheckBox("True bleed")
+        self._true_bleed_amount = self._make_mm_control(2.0)
+        self._true_bleed_amount.setEnabled(False)
+        self._true_bleed_checkbox.toggled.connect(
+            self._true_bleed_amount.setEnabled
+        )
+        self._true_bleed_checkbox.toggled.connect(self._refresh_summary)
+        self._true_bleed_amount.valueChanged.connect(self._refresh_summary)
+        true_bleed_layout = QHBoxLayout()
+        true_bleed_layout.addWidget(self._true_bleed_checkbox)
+        true_bleed_layout.addWidget(QLabel("Bleed on each side:"))
+        true_bleed_layout.addWidget(self._true_bleed_amount)
+        true_bleed_layout.addWidget(QLabel("mm"))
+        true_bleed_layout.addStretch()
+
+        bleed_group = QGroupBox("Bleed and cutter options")
+        bleed_layout = QVBoxLayout(bleed_group)
+        bleed_layout.addLayout(fake_bleed_layout)
+        bleed_layout.addLayout(true_bleed_layout)
+
+        self._repeat_columns_control = QSpinBox()
+        self._repeat_columns_control.setRange(1, 100)
+        self._repeat_columns_control.setValue(self._repeat_columns)
+        self._repeat_rows_control = QSpinBox()
+        self._repeat_rows_control.setRange(1, 100)
+        self._repeat_rows_control.setValue(self._repeat_rows)
+        self._repeat_gap_control = QDoubleSpinBox()
+        self._repeat_gap_control.setRange(0.0, 100.0)
+        self._repeat_gap_control.setDecimals(2)
+        self._repeat_gap_control.setSingleStep(0.5)
+        self._repeat_gap_control.setSuffix(" mm")
+        self._repeat_gap_control.setValue(self._repeat_gap_mm)
+        repeat_controls = QHBoxLayout()
+        repeat_controls.addWidget(QLabel("Columns:"))
+        repeat_controls.addWidget(self._repeat_columns_control)
+        repeat_controls.addWidget(QLabel("Rows:"))
+        repeat_controls.addWidget(self._repeat_rows_control)
+        repeat_controls.addWidget(QLabel("Gap:"))
+        repeat_controls.addWidget(self._repeat_gap_control)
+
+        self._arrange_pages_checkbox = QCheckBox(
+            "Arrange consecutive pages into grid layouts"
+        )
+        self._repeat_pages_checkbox = QCheckBox(
+            "Place document pages in one grid; use per-page copy counts"
+        )
+        self._arrange_pages_checkbox.toggled.connect(
+            self._set_arrange_document_pages
+        )
+        self._repeat_pages_checkbox.toggled.connect(
+            self._set_repeat_pages_individually
+        )
+        self._repeat_columns_control.valueChanged.connect(
+            self._repeat_settings_changed
+        )
+        self._repeat_rows_control.valueChanged.connect(
+            self._repeat_settings_changed
+        )
+        self._repeat_gap_control.valueChanged.connect(
+            self._repeat_settings_changed
+        )
+        repeat_group = QGroupBox("Repeat and multipage layout")
+        repeat_layout = QVBoxLayout(repeat_group)
+        repeat_layout.addLayout(repeat_controls)
+        repeat_layout.addWidget(self._arrange_pages_checkbox)
+        repeat_layout.addWidget(self._repeat_pages_checkbox)
 
         self._summary_label = QLabel(
             "Load a PDF to inspect its page boxes and resulting cut size."
@@ -604,16 +840,41 @@ class MainWindow(QMainWindow):
             "Expanded output size will be shown here after loading a PDF."
         )
         self._output_size_label.setWordWrap(True)
-        self._repeat_layout_button = QPushButton(
-            f"Repeat layout: 1 x 1 ({DEFAULT_REPEAT_GAP_MM:.2f} mm gap)"
-        )
-        self._repeat_layout_button.clicked.connect(self._edit_repeat_layout)
         self._generate_button = QPushButton("Generate files of size —")
         self._generate_button.setEnabled(False)
         self._generate_button.clicked.connect(self._generate_files)
-        self._preview_button = QPushButton("Preview layout")
-        self._preview_button.setEnabled(False)
-        self._preview_button.clicked.connect(self._show_preview)
+
+        self._actual_preview_checkbox = QCheckBox("Render actual PDF pages")
+        self._actual_preview_checkbox.setEnabled(False)
+        self._actual_preview_checkbox.toggled.connect(self._refresh_live_preview)
+        self._expanded_preview_window: ExpandedPreviewWindow | None = None
+        self._open_preview_window_button = QPushButton("Open larger preview")
+        self._open_preview_window_button.clicked.connect(
+            self._open_expanded_preview
+        )
+        self._live_preview_selector = QComboBox()
+        self._live_preview_selector.currentIndexChanged.connect(
+            self._refresh_live_preview
+        )
+        self._live_preview_widget = OutputPreviewWidget()
+        self._live_preview_widget.setMinimumSize(360, 240)
+        self._live_preview_details = QLabel(
+            "Load a PDF to see the output layout."
+        )
+        self._live_preview_details.setWordWrap(True)
+        live_preview_group = QGroupBox("Live layout preview")
+        live_preview_layout = QVBoxLayout(live_preview_group)
+        live_preview_layout.addWidget(self._open_preview_window_button)
+        live_preview_layout.addWidget(self._live_preview_selector)
+        live_preview_layout.addWidget(self._actual_preview_checkbox)
+        live_preview_layout.addWidget(self._live_preview_widget, stretch=1)
+        live_preview_layout.addWidget(self._live_preview_details)
+        live_preview_layout.addWidget(
+            QLabel(
+                "Shaded = source page; dashed red = cutter rectangle; "
+                "black = registration dots. Page numbers identify source pages."
+            )
+        )
 
         central_widget = QWidget()
         root_layout = QHBoxLayout(central_widget)
@@ -631,11 +892,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(safety_group)
         left_layout.addWidget(layout_group)
         left_layout.addWidget(bleed_group)
+        left_layout.addWidget(repeat_group)
         left_layout.addWidget(self._summary_label)
         left_layout.addWidget(self._output_size_label)
-        left_layout.addWidget(self._repeat_layout_button)
         button_row = QHBoxLayout()
-        button_row.addWidget(self._preview_button)
         button_row.addWidget(self._generate_button, stretch=1)
         left_layout.addLayout(button_row)
         left_layout.addStretch()
@@ -644,7 +904,11 @@ class MainWindow(QMainWindow):
         left_scroll_area.setWidgetResizable(True)
         left_scroll_area.setWidget(left_panel)
         root_layout.addWidget(left_scroll_area, stretch=1)
-        root_layout.addWidget(self._dimensions_group, stretch=1)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.addWidget(self._dimensions_group, stretch=2)
+        right_layout.addWidget(live_preview_group, stretch=3)
+        root_layout.addWidget(right_panel, stretch=1)
         self.setCentralWidget(central_widget)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -704,12 +968,67 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Could not read PDF", str(error))
             return
 
+        self._close_pdf_preview()
+        preview_buffer: QBuffer | None = None
+        preview_document: QPdfDocument | None = None
+        try:
+            with pikepdf.Pdf.open(path) as preview_pdf:
+                for page in preview_pdf.pages:
+                    page.obj["/CropBox"] = pikepdf.Array(page.mediabox)
+                preview_pdf_bytes = BytesIO()
+                preview_pdf.save(preview_pdf_bytes)
+
+            preview_buffer = QBuffer(self)
+            preview_buffer.setData(preview_pdf_bytes.getvalue())
+            if not preview_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+                raise OSError("Could not open the in-memory PDF preview.")
+
+            preview_document = QPdfDocument(self)
+            preview_document.load(preview_buffer)
+            if (
+                preview_document.status() != QPdfDocument.Status.Ready
+                or preview_document.pageCount() != len(pages)
+            ):
+                raise ValueError("Could not render the PDF preview.")
+
+            self._pdf_preview_document = preview_document
+            self._preview_pdf_buffer = preview_buffer
+            self._preview_error = None
+        except (OSError, pikepdf.PdfError, ValueError) as error:
+            if preview_document is not None:
+                preview_document.close()
+                preview_document.deleteLater()
+            if preview_buffer is not None:
+                preview_buffer.close()
+                preview_buffer.deleteLater()
+            self._pdf_preview_document = None
+            self._preview_pdf_buffer = None
+            self._preview_error = f"Could not load PDF preview: {error}"
+            QMessageBox.warning(
+                self,
+                "Page preview unavailable",
+                self._preview_error,
+            )
+        self._preview_image_cache.clear()
         self._source_path = path
         self._pages = pages
         self._source_field.setText(str(path))
+        preview_available = self._pdf_preview_document is not None
+        self._actual_preview_checkbox.setEnabled(preview_available)
+        self._actual_preview_checkbox.setChecked(preview_available)
         self._populate_dimensions_table()
         self._update_box_selection_mode()
         self._refresh_summary()
+
+    def _close_pdf_preview(self) -> None:
+        if self._pdf_preview_document is not None:
+            self._pdf_preview_document.close()
+            self._pdf_preview_document.deleteLater()
+            self._pdf_preview_document = None
+        if self._preview_pdf_buffer is not None:
+            self._preview_pdf_buffer.close()
+            self._preview_pdf_buffer.deleteLater()
+            self._preview_pdf_buffer = None
 
     def _choose_output_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(
@@ -744,6 +1063,12 @@ class MainWindow(QMainWindow):
             selection.currentIndexChanged.connect(self._refresh_summary)
             self._dimensions_table.setCellWidget(row, len(BOX_NAMES) + 1, selection)
 
+            copies = QSpinBox()
+            copies.setRange(0, 1000)
+            copies.setValue(1)
+            copies.valueChanged.connect(self._refresh_summary)
+            self._dimensions_table.setCellWidget(row, len(BOX_NAMES) + 2, copies)
+
         self._dimensions_table.resizeColumnsToContents()
 
     def _update_box_selection_mode(self) -> None:
@@ -755,6 +1080,9 @@ class MainWindow(QMainWindow):
             selection = self._dimensions_table.cellWidget(row, len(BOX_NAMES) + 1)
             if isinstance(selection, QComboBox):
                 selection.setEnabled(page_by_page)
+            copies = self._dimensions_table.cellWidget(row, len(BOX_NAMES) + 2)
+            if isinstance(copies, QSpinBox):
+                copies.setEnabled(self._repeat_pages_checkbox.isChecked())
         self._refresh_summary()
 
     def _selected_boxes(self) -> list[tuple[PageDimensions, str]]:
@@ -773,6 +1101,52 @@ class MainWindow(QMainWindow):
             "CropBox",
         )
         return [(page, selected_box) for page in self._pages]
+
+    def _selected_page_copy_counts(self) -> list[int]:
+        counts = []
+        for row in range(self._dimensions_table.rowCount()):
+            control = self._dimensions_table.cellWidget(
+                row,
+                len(BOX_NAMES) + 2,
+            )
+            counts.append(control.value() if isinstance(control, QSpinBox) else 1)
+        return counts
+
+    def _layout_boxes(
+        self,
+        selected: list[tuple[PageDimensions, str]],
+    ) -> list[BoxDimensions]:
+        boxes = [page.boxes[box_name] for page, box_name in selected]
+        if not self._true_bleed_checkbox.isChecked():
+            return boxes
+        bleed_mm = self._true_bleed_amount.value()
+        return [
+            expanded_bleed_box(box, page.boxes["MediaBox"], bleed_mm)
+            for (page, _), box in zip(selected, boxes)
+        ]
+
+    def _layout_gap_mm(self) -> float:
+        if not self._true_bleed_checkbox.isChecked():
+            return self._repeat_gap_mm
+        has_adjacent_pages = (
+            sum(self._selected_page_copy_counts()) > 1
+            if self._repeat_pages_individually
+            else (
+                self._arrange_document_pages
+                and len(self._selected_boxes()) > 1
+                and self._repeat_columns * self._repeat_rows > 1
+            )
+            or (
+                not self._arrange_document_pages
+                and (self._repeat_columns > 1 or self._repeat_rows > 1)
+            )
+        )
+        if not has_adjacent_pages:
+            return self._repeat_gap_mm
+        return true_bleed_gap_mm(
+            self._repeat_gap_mm,
+            self._true_bleed_amount.value(),
+        )
 
     def _refresh_summary(self, *_args: object) -> None:
         if not self._pages:
@@ -794,6 +1168,23 @@ class MainWindow(QMainWindow):
                 for page, box_name in selected
             )
 
+        generation_valid = True
+        try:
+            layout_dimensions = self._layout_boxes(selected)
+            layout_gap_mm = self._layout_gap_mm()
+        except ValueError as error:
+            layout_dimensions = dimensions
+            layout_gap_mm = self._repeat_gap_mm
+            generation_valid = False
+            bleed_summary = str(error)
+        else:
+            bleed_summary = (
+                f"True bleed: {self._true_bleed_amount.value():.2f} mm per side; "
+                f"{layout_gap_mm:.2f} mm between printed pages."
+                if self._true_bleed_checkbox.isChecked()
+                else "True bleed is off."
+            )
+
         if self._fake_bleed_checkbox.isChecked():
             inset = self._fake_bleed_inset.value()
             try:
@@ -807,7 +1198,6 @@ class MainWindow(QMainWindow):
                     "Fake bleed inset is too large for at least one selected page."
                 )
             else:
-                generation_valid = True
                 unique_cut_sizes = {
                     (round(width, 2), round(height, 2))
                     for width, height in cut_sizes
@@ -826,7 +1216,6 @@ class MainWindow(QMainWindow):
                         for (page, _), (width, height) in zip(selected, cut_sizes)
                     )
         else:
-            generation_valid = True
             cut_summary = (
                 "Cutter rectangle matches the selected source box; fake bleed "
                 "is off."
@@ -836,19 +1225,34 @@ class MainWindow(QMainWindow):
         layout_description = (
             "left and right" if layout == "left_right" else "top and bottom"
         )
-        if self._arrange_document_pages:
+        page_copy_counts = self._selected_page_copy_counts()
+        if self._repeat_pages_individually:
+            copy_total = sum(page_copy_counts)
+            capacity = self._repeat_columns * self._repeat_rows
+            if copy_total == 0 or copy_total > capacity:
+                output_geometries = []
+                generation_valid = False
+            else:
+                output_geometries = [
+                    repeated_document_layout_geometry(
+                        layout_dimensions,
+                        page_copy_counts,
+                        layout,
+                        self._safety_distance.value(),
+                        self._repeat_columns,
+                        self._repeat_rows,
+                        layout_gap_mm,
+                    )
+                ]
+        elif self._arrange_document_pages:
             output_geometries = document_layout_geometries(
-                dimensions,
+                layout_dimensions,
                 layout,
                 self._safety_distance.value(),
                 self._repeat_columns,
                 self._repeat_rows,
-                self._repeat_gap_mm,
+                layout_gap_mm,
             )
-            output_sizes = {
-                (round(item.width_mm, 2), round(item.height_mm, 2))
-                for item in output_geometries
-            }
         else:
             output_geometries = [
                 repeated_output_geometry(
@@ -857,18 +1261,40 @@ class MainWindow(QMainWindow):
                     self._safety_distance.value(),
                     self._repeat_columns,
                     self._repeat_rows,
-                    self._repeat_gap_mm,
+                    layout_gap_mm,
                 )
-                for box in dimensions
+                for box in layout_dimensions
             ]
-            output_sizes = {
-                (round(item.width_mm, 2), round(item.height_mm, 2))
-                for item in output_geometries
-            }
-        if len(output_sizes) == 1:
+        output_sizes = {
+            (round(item.width_mm, 2), round(item.height_mm, 2))
+            for item in output_geometries
+        }
+        if self._repeat_pages_individually and not output_geometries:
+            copy_total = sum(page_copy_counts)
+            capacity = self._repeat_columns * self._repeat_rows
+            if copy_total == 0:
+                output_summary = "Set at least one page copy to make a layout."
+            else:
+                output_summary = (
+                    f"Page copies require {copy_total} grid slots, but the "
+                    f"configured grid has {capacity}. Increase rows or columns "
+                    "or lower the per-page copy counts."
+                )
+            self._generate_button.setText("Page copies do not fit")
+        elif len(output_sizes) == 1:
             output_width, output_height = next(iter(output_sizes))
             output_size = f"{output_width:.2f} x {output_height:.2f} mm"
-            if self._arrange_document_pages:
+            if self._repeat_pages_individually:
+                output_summary = (
+                    f"One {self._repeat_columns} x {self._repeat_rows} grid; "
+                    f"{sum(page_copy_counts)} of "
+                    f"{self._repeat_columns * self._repeat_rows} slots used, "
+                    f"{self._repeat_gap_mm:.2f} mm gap: {output_size}."
+                )
+                self._generate_button.setText(
+                    f"Generate single layout of size {output_size}"
+                )
+            elif self._arrange_document_pages:
                 output_summary = (
                     f"{len(output_geometries)} output layout(s), "
                     f"{self._repeat_columns} across x {self._repeat_rows} down "
@@ -924,63 +1350,373 @@ class MainWindow(QMainWindow):
 
         self._summary_label.setText(
             f"{len(self._pages)} page(s). {source_summary} {cut_summary} "
+            f"{bleed_summary} "
             f"Safety distance: {self._safety_distance.value():.2f} mm."
         )
         self._output_size_label.setText(output_summary)
+        self._refresh_live_preview()
         self._generate_button.setEnabled(
             generation_valid
             and self._source_path is not None
             and self._output_directory is not None
             and bool(selected)
         )
-        self._preview_button.setEnabled(generation_valid and bool(selected))
 
-    def _show_preview(self) -> None:
+    def _refresh_live_preview(self, *_args: object) -> None:
         selected = self._selected_boxes()
         if not selected:
             return
-        layout = "left_right" if self._left_right_layout.isChecked() else "top_bottom"
-        dialog = OutputPreviewDialog(
-            selected,
-            layout,
-            self._safety_distance.value(),
-            self._fake_bleed_checkbox.isChecked(),
-            self._fake_bleed_inset.value(),
-            self,
-            self._repeat_columns,
-            self._repeat_rows,
-            self._repeat_gap_mm,
-            self._arrange_document_pages,
-        )
-        dialog.exec()
+        if self._actual_preview_checkbox.isChecked():
+            self._preview_error = None
 
-    def _edit_repeat_layout(self) -> None:
-        dialog = RepeatLayoutDialog(
-            self._repeat_columns,
-            self._repeat_rows,
-            self._repeat_gap_mm,
-            self,
-            self._arrange_document_pages,
-        )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        layout = "left_right" if self._left_right_layout.isChecked() else "top_bottom"
+        dimensions = [page.boxes[box_name] for page, box_name in selected]
+        selector = self._live_preview_selector
+        previous_selection = selector.currentData()
+        selector.blockSignals(True)
+        selector.clear()
+        try:
+            layout_dimensions = self._layout_boxes(selected)
+            layout_gap_mm = self._layout_gap_mm()
+        except ValueError as error:
+            self._live_preview_details.setText(str(error))
+            self._live_preview_widget.clear_preview()
+            selector.addItem("Bleed unavailable", 0)
+            selector.blockSignals(False)
+            selector.setVisible(False)
+            if self._expanded_preview_window is not None:
+                self._expanded_preview_window.update_preview(
+                    self._live_preview_widget,
+                    self._live_preview_details.text(),
+                )
             return
-        (
-            self._repeat_columns,
-            self._repeat_rows,
-            self._repeat_gap_mm,
-            self._arrange_document_pages,
-        ) = dialog.settings
-        if self._arrange_document_pages:
-            self._repeat_layout_button.setText(
-                f"Arrange document: {self._repeat_columns} x "
-                f"{self._repeat_rows} ({self._repeat_gap_mm:.2f} mm gap)"
+
+        if self._repeat_pages_individually:
+            page_copy_counts = self._selected_page_copy_counts()
+            try:
+                geometry = repeated_document_layout_geometry(
+                    layout_dimensions,
+                    page_copy_counts,
+                    layout,
+                    self._safety_distance.value(),
+                    self._repeat_columns,
+                    self._repeat_rows,
+                    layout_gap_mm,
+                )
+            except ValueError as error:
+                self._live_preview_details.setText(str(error))
+                self._live_preview_widget.clear_preview()
+                selector.addItem("Grid does not fit", 0)
+            else:
+                self._set_live_document_preview(
+                    selected,
+                    geometry,
+                    "per-page copies in configured grid; unused cells blank",
+                )
+                selector.addItem("Page-copy layout", 0)
+        elif self._arrange_document_pages:
+            layouts = document_layout_geometries(
+                layout_dimensions,
+                layout,
+                self._safety_distance.value(),
+                self._repeat_columns,
+                self._repeat_rows,
+                layout_gap_mm,
+            )
+            for layout_index, document_layout in enumerate(layouts):
+                page_numbers = [
+                    selected[placement.page_index][0].page_number
+                    for placement in document_layout.placements
+                ]
+                selector.addItem(
+                    f"Layout {layout_index + 1}: pages "
+                    f"{page_numbers[0]}–{page_numbers[-1]}",
+                    layout_index,
+                )
+            index = (
+                previous_selection
+                if isinstance(previous_selection, int)
+                and 0 <= previous_selection < len(layouts)
+                else 0
+            )
+            selector.setCurrentIndex(index)
+            self._set_live_document_preview(
+                selected,
+                layouts[index],
+                "unused slots blank",
             )
         else:
-            self._repeat_layout_button.setText(
-                f"Repeat layout: {self._repeat_columns} x {self._repeat_rows} "
-                f"({self._repeat_gap_mm:.2f} mm gap)"
+            for page_index, (page, box_name) in enumerate(selected):
+                selector.addItem(
+                    f"Page {page.page_number} — {box_name}",
+                    page_index,
+                )
+            index = (
+                previous_selection
+                if isinstance(previous_selection, int)
+                and 0 <= previous_selection < len(selected)
+                else 0
             )
+            selector.setCurrentIndex(index)
+            page, box_name = selected[index]
+            box = page.boxes[box_name]
+            layout_box = layout_dimensions[index]
+            geometry = repeated_output_geometry(
+                layout_box,
+                layout,
+                self._safety_distance.value(),
+                self._repeat_columns,
+                self._repeat_rows,
+                layout_gap_mm,
+            )
+            cut_width, cut_height, cut_status = self._preview_cut_size(box)
+            page_number = page.page_number
+            page_image = (
+                self._preview_page_image(page_number, layout_box)
+                if self._actual_preview_checkbox.isChecked()
+                else None
+            )
+            self._live_preview_widget.set_preview(
+                layout_box,
+                geometry,
+                layout,
+                cut_width,
+                cut_height,
+                self._repeat_columns,
+                self._repeat_rows,
+                layout_gap_mm,
+                tiles=[
+                    (
+                        layout_box,
+                        column * (layout_box.width_mm + layout_gap_mm),
+                        row * (layout_box.height_mm + layout_gap_mm),
+                        cut_width,
+                        cut_height,
+                        page_number,
+                        page_image,
+                    )
+                    for row in range(self._repeat_rows)
+                    for column in range(self._repeat_columns)
+                ],
+                show_page_numbers=len(self._pages) > 1,
+            )
+            self._live_preview_details.setText(
+                f"Output: {geometry.width_mm:.2f} x {geometry.height_mm:.2f} mm | "
+                f"Page {page.page_number}: {box.format_mm()} | "
+                + (
+                    f"True bleed: {self._true_bleed_amount.value():.2f} mm per side; "
+                    f"{layout_gap_mm:.2f} mm printed gap | "
+                    if self._true_bleed_checkbox.isChecked()
+                    else ""
+                )
+                + f"Repeat: {self._repeat_columns} x {self._repeat_rows}, "
+                f"{self._repeat_gap_mm:.2f} mm gap | {cut_status}"
+                + (
+                    f" | {self._preview_error}"
+                    if self._actual_preview_checkbox.isChecked()
+                    and self._preview_error is not None
+                    else ""
+                )
+            )
+
+        selector.blockSignals(False)
+        selector.setVisible(selector.count() > 1)
+        if self._expanded_preview_window is not None:
+            self._expanded_preview_window.update_preview(
+                self._live_preview_widget,
+                self._live_preview_details.text(),
+            )
+
+    def _preview_page_image(
+        self,
+        page_number: int,
+        box: BoxDimensions,
+    ) -> QImage | None:
+        if page_number in self._preview_image_cache:
+            media_image = self._preview_image_cache[page_number]
+        else:
+            document = self._pdf_preview_document
+            if document is None:
+                return None
+
+            page_index = page_number - 1
+            page_size = document.pagePointSize(page_index)
+            if page_size.width() <= 0 or page_size.height() <= 0:
+                self._preview_error = (
+                    f"Could not determine size for page {page_number}."
+                )
+                return None
+            scale = 600 / max(page_size.width(), page_size.height())
+            media_image = document.render(
+                page_index,
+                QSize(
+                    max(1, round(page_size.width() * scale)),
+                    max(1, round(page_size.height() * scale)),
+                ),
+            )
+            if media_image.isNull():
+                self._preview_error = f"Could not render page {page_number}."
+                return None
+            self._preview_image_cache[page_number] = media_image
+
+        media_box = self._pages[page_number - 1].boxes["MediaBox"]
+        if media_box.width_points <= 0 or media_box.height_points <= 0:
+            self._preview_error = f"Could not determine bounds for page {page_number}."
+            return None
+
+        scale_x = media_image.width() / media_box.width_points
+        scale_y = media_image.height() / media_box.height_points
+        left = round((box.left - media_box.left) * scale_x)
+        top = round((media_box.top - box.top) * scale_y)
+        right = round((box.right - media_box.left) * scale_x)
+        bottom = round((media_box.top - box.bottom) * scale_y)
+        left = min(max(left, 0), media_image.width() - 1)
+        top = min(max(top, 0), media_image.height() - 1)
+        right = min(max(right, left + 1), media_image.width())
+        bottom = min(max(bottom, top + 1), media_image.height())
+        return media_image.copy(left, top, right - left, bottom - top)
+
+    def _preview_cut_size(self, box: BoxDimensions) -> tuple[float, float, str]:
+        if not self._fake_bleed_checkbox.isChecked():
+            return box.width_mm, box.height_mm, "no fake bleed"
+        inset = self._fake_bleed_inset.value()
+        try:
+            width, height = cutter_rectangle_size(box, inset)
+        except ValueError:
+            return 0.0, 0.0, f"invalid {inset:.2f} mm inset"
+        return width, height, (
+            f"{inset:.2f} mm inset per side; cutter "
+            f"{width:.2f} x {height:.2f} mm"
+        )
+
+    def _set_live_document_preview(
+        self,
+        selected: list[tuple[PageDimensions, str]],
+        document_layout: DocumentLayoutGeometry,
+        layout_note: str,
+    ) -> None:
+        tiles = []
+        layout_dimensions = self._layout_boxes(selected)
+        for placement in document_layout.placements:
+            page, box_name = selected[placement.page_index]
+            box = page.boxes[box_name]
+            layout_box = layout_dimensions[placement.page_index]
+            cut_width, cut_height, _ = self._preview_cut_size(box)
+            page_image = (
+                self._preview_page_image(page.page_number, layout_box)
+                if self._actual_preview_checkbox.isChecked()
+                else None
+            )
+            tiles.append(
+                (
+                    layout_box,
+                    placement.offset_x_mm,
+                    placement.offset_y_mm,
+                    cut_width,
+                    cut_height,
+                    page.page_number,
+                    page_image,
+                )
+            )
+        first_page = selected[document_layout.placements[0].page_index][0].page_number
+        last_page = selected[document_layout.placements[-1].page_index][0].page_number
+        geometry = OutputPageGeometry(
+            document_layout.width_mm,
+            document_layout.height_mm,
+            document_layout.source_offset_x_mm,
+            document_layout.source_offset_y_mm,
+        )
+        self._live_preview_widget.set_preview(
+            tiles[0][0],
+            geometry,
+            "left_right" if self._left_right_layout.isChecked() else "top_bottom",
+            tiles[0][3],
+            tiles[0][4],
+            tiles=tiles,
+            layout_extent_mm=(
+                document_layout.grid_width_mm,
+                document_layout.grid_height_mm,
+            ),
+            show_page_numbers=len(self._pages) > 1,
+        )
+        cut_statuses = [
+            self._preview_cut_size(page.boxes[box_name])[2]
+            for page, box_name in selected
+        ]
+        cut_status = (
+            "invalid fake bleed inset for at least one source page"
+            if any(status.startswith("invalid") for status in cut_statuses)
+            else (
+                f"fake bleed inset {self._fake_bleed_inset.value():.2f} mm per side"
+                if self._fake_bleed_checkbox.isChecked()
+                else "no fake bleed"
+            )
+        )
+        copy_counts = [
+            sum(
+                placement.page_index == page_index
+                for placement in document_layout.placements
+            )
+            for page_index in range(len(selected))
+        ]
+        copy_summary = ", ".join(
+            f"p{page.page_number} x{count}"
+            for (page, _), count in zip(selected, copy_counts)
+            if count
+        )
+        self._live_preview_details.setText(
+            f"Output: {geometry.width_mm:.2f} x {geometry.height_mm:.2f} mm | "
+            f"Pages {first_page}–{last_page} | {copy_summary} | "
+            f"{layout_note} | {cut_status}"
+            + (
+                f" | true bleed {self._true_bleed_amount.value():.2f} mm per side, "
+                f"{self._layout_gap_mm():.2f} mm printed gap"
+                if self._true_bleed_checkbox.isChecked()
+                else ""
+            )
+            + (
+                f" | {self._preview_error}"
+                if self._actual_preview_checkbox.isChecked()
+                and self._preview_error is not None
+                else ""
+            )
+        )
+
+    def _repeat_settings_changed(self, *_args: object) -> None:
+        self._repeat_columns = self._repeat_columns_control.value()
+        self._repeat_rows = self._repeat_rows_control.value()
+        self._repeat_gap_mm = self._repeat_gap_control.value()
         self._refresh_summary()
+
+    def _set_arrange_document_pages(self, enabled: bool) -> None:
+        self._arrange_document_pages = enabled
+        if enabled:
+            self._repeat_pages_checkbox.setChecked(False)
+        self._refresh_summary()
+
+    def _set_repeat_pages_individually(self, enabled: bool) -> None:
+        self._repeat_pages_individually = enabled
+        if enabled:
+            self._arrange_pages_checkbox.setChecked(False)
+        for row in range(self._dimensions_table.rowCount()):
+            control = self._dimensions_table.cellWidget(
+                row,
+                len(BOX_NAMES) + 2,
+            )
+            if isinstance(control, QSpinBox):
+                control.setEnabled(enabled)
+        self._refresh_summary()
+
+    def _open_expanded_preview(self) -> None:
+        if self._expanded_preview_window is None:
+            self._expanded_preview_window = ExpandedPreviewWindow(self)
+        self._expanded_preview_window.update_preview(
+            self._live_preview_widget,
+            self._live_preview_details.text(),
+        )
+        self._expanded_preview_window.show()
+        self._expanded_preview_window.raise_()
+        self._expanded_preview_window.activateWindow()
 
     def _generate_files(self) -> None:
         if self._source_path is None or self._output_directory is None:
@@ -993,15 +1729,36 @@ class MainWindow(QMainWindow):
 
         selected = self._selected_boxes()
         layout = "left_right" if self._left_right_layout.isChecked() else "top_bottom"
-        dimensions = [page.boxes[box_name] for page, box_name in selected]
-        if self._arrange_document_pages:
+        try:
+            dimensions = self._layout_boxes(selected)
+            layout_gap_mm = self._layout_gap_mm()
+        except ValueError as error:
+            QMessageBox.warning(self, "True bleed unavailable", str(error))
+            return
+        page_copy_counts = self._selected_page_copy_counts()
+        if self._repeat_pages_individually:
+            try:
+                output_geometry = repeated_document_layout_geometry(
+                    dimensions,
+                    page_copy_counts,
+                    layout,
+                    self._safety_distance.value(),
+                    self._repeat_columns,
+                    self._repeat_rows,
+                    layout_gap_mm,
+                )
+            except ValueError as error:
+                QMessageBox.warning(self, "Page copies do not fit", str(error))
+                return
+            output_geometries = [output_geometry]
+        elif self._arrange_document_pages:
             output_geometries = document_layout_geometries(
                 dimensions,
                 layout,
                 self._safety_distance.value(),
                 self._repeat_columns,
                 self._repeat_rows,
-                self._repeat_gap_mm,
+                layout_gap_mm,
             )
         else:
             output_geometries = [
@@ -1011,7 +1768,7 @@ class MainWindow(QMainWindow):
                     self._safety_distance.value(),
                     self._repeat_columns,
                     self._repeat_rows,
-                    self._repeat_gap_mm,
+                    layout_gap_mm,
                 )
                 for box in dimensions
             ]
@@ -1063,6 +1820,9 @@ class MainWindow(QMainWindow):
                 self._repeat_rows,
                 self._repeat_gap_mm,
                 self._arrange_document_pages,
+                page_copy_counts if self._repeat_pages_individually else None,
+                self._true_bleed_checkbox.isChecked(),
+                self._true_bleed_amount.value(),
             )
         except (OSError, pikepdf.PdfError, ValueError) as error:
             QMessageBox.critical(self, "Could not generate PDFs", str(error))

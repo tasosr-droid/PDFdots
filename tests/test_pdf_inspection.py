@@ -10,8 +10,11 @@ from pdfdots.pdf_inspection import (
     cutter_rectangle_size,
     document_layout_geometries,
     expanded_output_geometry,
+    expanded_bleed_box,
     inspect_pdf,
+    repeated_document_layout_geometry,
     repeated_output_geometry,
+    true_bleed_gap_mm,
 )
 
 
@@ -55,6 +58,41 @@ class PdfInspectionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "too large"):
             cutter_rectangle_size(source_box, 2)
+
+    def test_true_bleed_expands_selected_box_inside_media_box(self) -> None:
+        media_box = BoxDimensions(
+            "MediaBox",
+            0,
+            0,
+            214 * 72 / 25.4,
+            301 * 72 / 25.4,
+        )
+        crop_box = BoxDimensions(
+            "CropBox",
+            2 * 72 / 25.4,
+            2 * 72 / 25.4,
+            212 * 72 / 25.4,
+            299 * 72 / 25.4,
+        )
+
+        bleed_box = expanded_bleed_box(crop_box, media_box, 2)
+
+        self.assertAlmostEqual(bleed_box.width_mm, 214)
+        self.assertAlmostEqual(bleed_box.height_mm, 301)
+        self.assertAlmostEqual(bleed_box.left, media_box.left)
+        self.assertAlmostEqual(bleed_box.bottom, media_box.bottom)
+        self.assertAlmostEqual(bleed_box.right, media_box.right)
+        self.assertAlmostEqual(bleed_box.top, media_box.top)
+
+    def test_true_bleed_rejects_missing_artwork_and_page_overlap(self) -> None:
+        media_box = BoxDimensions("MediaBox", 0, 0, 212, 299)
+        crop_box = BoxDimensions("CropBox", 2, 2, 212, 299)
+
+        with self.assertRaisesRegex(ValueError, "extends beyond the page's MediaBox"):
+            expanded_bleed_box(crop_box, media_box, 2)
+        with self.assertRaisesRegex(ValueError, "printed pages overlap"):
+            true_bleed_gap_mm(3, 2)
+        self.assertEqual(true_bleed_gap_mm(5, 2), 1)
 
     def test_left_right_layout_includes_dots_and_safety_distance(self) -> None:
         source_box = BoxDimensions("CropBox", 0, 0, 210 * 72 / 25.4, 297 * 72 / 25.4)
@@ -167,6 +205,63 @@ class PdfInspectionTests(unittest.TestCase):
         self.assertAlmostEqual(layouts[0].placements[0].offset_y_mm, 316.5)
         self.assertAlmostEqual(layouts[0].placements[3].offset_x_mm, 230)
         self.assertAlmostEqual(layouts[0].placements[3].offset_y_mm, 7.5)
+
+    def test_page_copy_counts_fill_fixed_grid_in_page_order(self) -> None:
+        boxes = [
+            BoxDimensions("CropBox", 0, 0, 215 * 72 / 25.4, 302 * 72 / 25.4),
+            BoxDimensions("CropBox", 0, 0, 210 * 72 / 25.4, 297 * 72 / 25.4),
+            BoxDimensions("CropBox", 0, 0, 220 * 72 / 25.4, 310 * 72 / 25.4),
+        ]
+
+        geometry = repeated_document_layout_geometry(
+            boxes,
+            [2, 2, 4],
+            "left_right",
+            1,
+            repeat_columns=4,
+            repeat_rows=2,
+            repeat_gap_mm=5,
+        )
+
+        self.assertEqual(len(geometry.placements), 8)
+        self.assertEqual(
+            [placement.page_index for placement in geometry.placements],
+            [0, 0, 1, 1, 2, 2, 2, 2],
+        )
+        self.assertAlmostEqual(geometry.grid_width_mm, 895)
+        self.assertAlmostEqual(geometry.grid_height_mm, 617)
+        self.assertAlmostEqual(geometry.width_mm, 919)
+        self.assertAlmostEqual(geometry.height_mm, 619)
+        self.assertAlmostEqual(geometry.placements[0].offset_y_mm, 315)
+        self.assertAlmostEqual(geometry.placements[2].offset_x_mm, 455)
+        self.assertAlmostEqual(geometry.placements[4].offset_y_mm, 0)
+
+    def test_page_copy_counts_reject_overflow_and_leave_unused_cells(self) -> None:
+        box = BoxDimensions("CropBox", 0, 0, 215 * 72 / 25.4, 302 * 72 / 25.4)
+
+        geometry = repeated_document_layout_geometry(
+            [box, box],
+            [1, 1],
+            "left_right",
+            1,
+            repeat_columns=2,
+            repeat_rows=2,
+            repeat_gap_mm=5,
+        )
+        self.assertEqual(len(geometry.placements), 2)
+        self.assertAlmostEqual(geometry.grid_width_mm, 435)
+        self.assertAlmostEqual(geometry.grid_height_mm, 609)
+
+        with self.assertRaisesRegex(ValueError, "only 2"):
+            repeated_document_layout_geometry(
+                [box, box],
+                [2, 1],
+                "left_right",
+                1,
+                repeat_columns=1,
+                repeat_rows=2,
+                repeat_gap_mm=5,
+            )
 
 
 if __name__ == "__main__":
