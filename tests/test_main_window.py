@@ -134,16 +134,87 @@ class MainWindowTests(unittest.TestCase):
     def test_true_bleed_requires_enough_artwork_outside_selected_box(self) -> None:
         box = BoxDimensions("CropBox", 0, 0, 210 * 72 / 25.4, 297 * 72 / 25.4)
         boxes = {name: box for name in BOX_NAMES}
+        boxes["MediaBox"] = BoxDimensions(
+            "MediaBox",
+            -1.5 * 72 / 25.4,
+            -1.5 * 72 / 25.4,
+            211.5 * 72 / 25.4,
+            298.5 * 72 / 25.4,
+        )
         window = MainWindow()
         window._pages = [PageDimensions(page_number=1, boxes=boxes)]
         window._populate_dimensions_table()
         window._true_bleed_checkbox.setChecked(True)
 
-        self.assertIn("extends beyond the page's MediaBox", window._summary_label.text())
+        self.assertFalse(window._true_bleed_checkbox.isChecked())
+        self.assertFalse(window._true_bleed_checkbox.isEnabled())
         self.assertIn(
             "extends beyond the page's MediaBox",
-            window._live_preview_details.text(),
+            window._true_bleed_checkbox.toolTip(),
         )
+        self.assertNotIn("extends beyond the page's MediaBox", window._summary_label.text())
+        self.assertTrue(window._true_bleed_amount.isEnabled())
+
+        window._true_bleed_amount.setValue(1.0)
+        self.assertTrue(window._true_bleed_checkbox.isEnabled())
+        self.assertEqual(window._true_bleed_checkbox.toolTip(), "")
+        window._true_bleed_checkbox.setChecked(True)
+        self.assertIn("True bleed: 1.00 mm", window._summary_label.text())
+        window.close()
+
+    def test_reset_settings_restores_defaults_without_clearing_files(self) -> None:
+        boxes = {
+            name: BoxDimensions(name, 0, 0, 215 * 72 / 25.4, 302 * 72 / 25.4)
+            for name in BOX_NAMES
+        }
+        window = MainWindow()
+        window._pages = [PageDimensions(page_number=1, boxes=boxes)]
+        window._populate_dimensions_table()
+        window._source_field.setText("input.pdf")
+        window._output_field.setText("output")
+        window._job_description.setText("job")
+        window._page_by_page_radio.setChecked(True)
+        selection = window._dimensions_table.cellWidget(0, len(BOX_NAMES) + 1)
+        selection.setCurrentIndex(selection.findData("BleedBox"))
+        window._dimensions_table.cellWidget(
+            0,
+            len(BOX_NAMES) + 2,
+        ).setValue(4)
+        window._safety_distance.setValue(3.0)
+        window._top_bottom_layout.setChecked(True)
+        window._fake_bleed_checkbox.setChecked(True)
+        window._fake_bleed_inset.setValue(4.0)
+        window._true_bleed_checkbox.setChecked(True)
+        window._true_bleed_amount.setValue(3.0)
+        window._repeat_columns_control.setValue(2)
+        window._repeat_rows_control.setValue(3)
+        window._arrange_pages_checkbox.setChecked(True)
+
+        window._reset_settings_button.click()
+
+        self.assertTrue(window._whole_document_radio.isChecked())
+        self.assertTrue(window._box_radios["CropBox"].isChecked())
+        self.assertEqual(selection.currentData(), "CropBox")
+        self.assertEqual(
+            window._dimensions_table.cellWidget(
+                0,
+                len(BOX_NAMES) + 2,
+            ).value(),
+            1,
+        )
+        self.assertEqual(window._safety_distance.value(), 1.0)
+        self.assertTrue(window._left_right_layout.isChecked())
+        self.assertFalse(window._fake_bleed_checkbox.isChecked())
+        self.assertEqual(window._fake_bleed_inset.value(), 2.5)
+        self.assertFalse(window._true_bleed_checkbox.isChecked())
+        self.assertEqual(window._true_bleed_amount.value(), 2.0)
+        self.assertEqual(window._repeat_columns_control.value(), 1)
+        self.assertEqual(window._repeat_rows_control.value(), 1)
+        self.assertFalse(window._arrange_pages_checkbox.isChecked())
+        self.assertFalse(window._repeat_pages_checkbox.isChecked())
+        self.assertEqual(window._source_field.text(), "input.pdf")
+        self.assertEqual(window._output_field.text(), "output")
+        self.assertEqual(window._job_description.text(), "job")
         window.close()
 
     def test_actual_page_preview_renders_pdf_artwork_in_live_tiles(self) -> None:

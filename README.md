@@ -21,14 +21,16 @@ an input PDF.
 - Optional true bleed expands the printed artwork beyond the selected source
   box while leaving the cutter rectangle at the selected box. The default is
   2 mm per side and requires that much existing artwork outside the selected
-  box within the page's MediaBox. A 210 x 297 mm cut box with 2 mm of true
-  bleed prints a 214 x 301 mm image.
+  box within the page's MediaBox. The true-bleed control is disabled when the
+  selected pages or repeat gap cannot accommodate the configured amount. A
+  210 x 297 mm cut box with 2 mm of true bleed prints a 214 x 301 mm image.
 - The repeat gap is measured between cutter rectangles. True bleed extends
   into that gap: with a 5 mm gap and 2 mm of bleed per side, the printed
   images have 1 mm between them. The app rejects settings that would cause
   neighboring printed areas to overlap.
 - Safety distance defaults to 1 mm. Safety, fake-bleed inset, and true-bleed
-  amount are adjustable in the UI.
+  amount are adjustable in the UI. Use **Reset settings** to restore layout
+  and bleed defaults without clearing the selected files or job description.
 - The dot layout uses 6 mm dots, 8 mm offsets beyond the selected
   source box on the chosen pair of sides, and 3 mm offsets from the other two
   edges. The expanded output size is calculated from the dot bounds plus the

@@ -3,7 +3,16 @@ from io import BytesIO
 from pathlib import Path
 
 import pikepdf
-from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QBuffer,
+    QIODevice,
+    QPointF,
+    QRectF,
+    QSignalBlocker,
+    QSize,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -766,11 +775,9 @@ class MainWindow(QMainWindow):
         fake_bleed_layout.addStretch()
 
         self._true_bleed_checkbox = QCheckBox("True bleed")
+        self._true_bleed_checkbox.setEnabled(False)
         self._true_bleed_amount = self._make_mm_control(2.0)
         self._true_bleed_amount.setEnabled(False)
-        self._true_bleed_checkbox.toggled.connect(
-            self._true_bleed_amount.setEnabled
-        )
         self._true_bleed_checkbox.toggled.connect(self._refresh_summary)
         self._true_bleed_amount.valueChanged.connect(self._refresh_summary)
         true_bleed_layout = QHBoxLayout()
@@ -843,6 +850,8 @@ class MainWindow(QMainWindow):
         self._generate_button = QPushButton("Generate files of size —")
         self._generate_button.setEnabled(False)
         self._generate_button.clicked.connect(self._generate_files)
+        self._reset_settings_button = QPushButton("Reset settings")
+        self._reset_settings_button.clicked.connect(self._reset_settings)
 
         self._actual_preview_checkbox = QCheckBox("Render actual PDF pages")
         self._actual_preview_checkbox.setEnabled(False)
@@ -896,6 +905,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self._summary_label)
         left_layout.addWidget(self._output_size_label)
         button_row = QHBoxLayout()
+        button_row.addWidget(self._reset_settings_button)
         button_row.addWidget(self._generate_button, stretch=1)
         left_layout.addLayout(button_row)
         left_layout.addStretch()
@@ -1125,10 +1135,8 @@ class MainWindow(QMainWindow):
             for (page, _), box in zip(selected, boxes)
         ]
 
-    def _layout_gap_mm(self) -> float:
-        if not self._true_bleed_checkbox.isChecked():
-            return self._repeat_gap_mm
-        has_adjacent_pages = (
+    def _has_adjacent_pages(self) -> bool:
+        return (
             sum(self._selected_page_copy_counts()) > 1
             if self._repeat_pages_individually
             else (
@@ -1141,14 +1149,84 @@ class MainWindow(QMainWindow):
                 and (self._repeat_columns > 1 or self._repeat_rows > 1)
             )
         )
-        if not has_adjacent_pages:
+
+    def _update_true_bleed_availability(self) -> None:
+        selected = self._selected_boxes()
+        reason: str | None = None
+        if not selected:
+            reason = "Load a PDF before enabling true bleed."
+        else:
+            try:
+                for page, box_name in selected:
+                    expanded_bleed_box(
+                        page.boxes[box_name],
+                        page.boxes["MediaBox"],
+                        self._true_bleed_amount.value(),
+                    )
+                if self._has_adjacent_pages():
+                    true_bleed_gap_mm(
+                        self._repeat_gap_mm,
+                        self._true_bleed_amount.value(),
+                    )
+            except ValueError as error:
+                reason = str(error)
+
+        available = reason is None
+        if not available and self._true_bleed_checkbox.isChecked():
+            with QSignalBlocker(self._true_bleed_checkbox):
+                self._true_bleed_checkbox.setChecked(False)
+        self._true_bleed_checkbox.setEnabled(available)
+        self._true_bleed_checkbox.setToolTip(reason or "")
+        self._true_bleed_amount.setEnabled(
+            bool(self._pages)
+            and (
+                self._true_bleed_checkbox.isChecked()
+                or not available
+            )
+        )
+
+    def _layout_gap_mm(self) -> float:
+        if not self._true_bleed_checkbox.isChecked():
+            return self._repeat_gap_mm
+        if not self._has_adjacent_pages():
             return self._repeat_gap_mm
         return true_bleed_gap_mm(
             self._repeat_gap_mm,
             self._true_bleed_amount.value(),
         )
 
+    def _reset_settings(self) -> None:
+        self._whole_document_radio.setChecked(True)
+        self._box_radios["CropBox"].setChecked(True)
+        for row in range(self._dimensions_table.rowCount()):
+            selection = self._dimensions_table.cellWidget(
+                row,
+                len(BOX_NAMES) + 1,
+            )
+            if isinstance(selection, QComboBox):
+                selection.setCurrentIndex(selection.findData("CropBox"))
+            copies = self._dimensions_table.cellWidget(
+                row,
+                len(BOX_NAMES) + 2,
+            )
+            if isinstance(copies, QSpinBox):
+                copies.setValue(1)
+
+        self._safety_distance.setValue(1.0)
+        self._left_right_layout.setChecked(True)
+        self._fake_bleed_checkbox.setChecked(False)
+        self._fake_bleed_inset.setValue(2.5)
+        self._true_bleed_checkbox.setChecked(False)
+        self._true_bleed_amount.setValue(2.0)
+        self._repeat_columns_control.setValue(1)
+        self._repeat_rows_control.setValue(1)
+        self._repeat_gap_control.setValue(DEFAULT_REPEAT_GAP_MM)
+        self._arrange_pages_checkbox.setChecked(False)
+        self._repeat_pages_checkbox.setChecked(False)
+        self._refresh_summary()
+
     def _refresh_summary(self, *_args: object) -> None:
+        self._update_true_bleed_availability()
         if not self._pages:
             return
 
